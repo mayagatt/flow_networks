@@ -60,9 +60,9 @@ class FlowNetwork:
 
     # ── Physics ───────────────────────────────────────────────────────────────
 
-    def solve(self, Q_in: np.ndarray) -> dict:
+    def solve_q_p(self, Q_in: np.ndarray) -> dict:
         """
-        Solve pressures and edge flows given external current injections.
+        solve_q_p pressures and edge flows given external current injections.
 
         Parameters
         ----------
@@ -175,18 +175,27 @@ class FlowNetwork:
                                 log_scale=log_scale)
 
     def plot_flows(self, Q_in: np.ndarray, log_scale=False):
-        state = self.solve(Q_in)
+        state = self.solve_q_p(Q_in)
         self.plot_edge_property(state['flows'], title='Edge Flows',
                                 label='Flow', cmap=plt.cm.coolwarm,
                                 log_scale=log_scale)
 
     def print_edges(self, Q_in: np.ndarray):
         """Print edge index, nodes, flow, and conductance."""
-        state = self.solve(Q_in)
+        state = self.solve_q_p(Q_in)
         print(f"{'idx':>4}  {'edge':>8}  {'flow':>10}  {'conductance':>12}")
         print("-" * 40)
         for i, (u, v) in enumerate(self.edges):
             print(f"{i:>4}  ({u},{v}):  {state['flows'][i]:>10.4f}  "
                   f"{self.G[u][v]['weight']:>12.4f}")
 
+    def get_K(self):
+        """Return the edge conductances as a vector."""
+        return np.array([self.G[u][v]['weight'] for u, v in self.edges])
+    
+    def set_K(self, K_vec: np.ndarray):
+        """Set the edge conductances from a vector and rebuild matrices."""
+        for (u, v), k in zip(self.edges, K_vec):
+            self.G[u][v]['weight'] = k
+        self._build_matrices()
 
