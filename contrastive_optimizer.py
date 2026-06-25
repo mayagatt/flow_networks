@@ -22,6 +22,7 @@ class ContrastiveOptimizer:
     Q_in         : np.ndarray  — external current injections (source/sink vector)
     target_edge  : tuple       — (u, v) edge to control
     target_flow  : float       — desired flow on that edge
+    update_func  : str         — 'PD' = power dissipation difference, 'SR' = shear rate difference
     learning_rate: float       — step size for conductance updates
     nudge_strength: float      — scales how strongly Q_in is nudged in clamped phase
     loss_tol     : float       — stop when loss < loss_tol
@@ -53,7 +54,7 @@ class ContrastiveOptimizer:
         self.net = copy.deepcopy(network)           # working copy
         self.Q_in = Q_in.astype(float)
         self.target_edge = target_edge
-        self.target_flow = target_flow
+        self.desired_flow_target = target_flow
         self.lr = learning_rate
         self.eps = nudge_strength
         self.loss_tol = loss_tol
@@ -66,7 +67,7 @@ class ContrastiveOptimizer:
     # ── Loss ──────────────────────────────────────────────────────────────────
 
     def loss(self, flow_on_target: float) -> float:
-        return 0.5 * (flow_on_target - self.target_flow) ** 2
+        return 0.5 * (flow_on_target - self.desired_flow_target) ** 2
 
     # ── Update rule ───────────────────────────────────────────────────────────
 
@@ -98,12 +99,22 @@ class ContrastiveOptimizer:
         net = self.net
 
         # ── Clamped phase: nudge Q_in to push more flow through target edge ──
-        loss   = (net.solve(self.Q_in)['flows'][self.target_idx] - self.target_flow)**2
+        state_F = net.solve_q_p(self.Q_in)
+        p_F     = state_F['pressures']
+        q_F     = state_F['flows']
+
+        # distance of the current flow from the desired flow of the target edge
+        loss   = (q_F[self.target_idx] - self.desired_flow_target)**2 
+
+        # add flow to the target edge to the source/sink vector, according to the loss
         Qin_C   = self.Q_in + self.eps * loss * net.B[:, self.target_idx]
-        state_C = net.solve(Qin_C)
+
+        # resolve the state of the network in its clamped state
+        state_C = net.solve_q_p(Qin_C)
         p_C     = state_C['pressures']
 
         # ── Conductance update ────────────────────────────────────────────────
+        # compute dk for each edge based on the difference between the free and clamped phases
         if self.update_func == 'PD':
             dk = self._conductance_update_PD(p_F, p_C)
         elif self.update_func == 'SR':
@@ -111,14 +122,13 @@ class ContrastiveOptimizer:
         else:
             raise ValueError(f"Invalid update_func: {self.update_func}. Choose 'PD' or 'SR'.")
 
-        for e, (u, v) in enumerate(net.edges):
-            net.G[u][v]['weight'] = max(net.G[u][v]['weight'] + dk[e], 1e-4)
-
-        # ── Rebuild matrices with new weights ─────────────────────────────────
-        net._build_matrices()
+        # apply dk to the edge weights, ensuring they remain positive
+        k = net.get_K()
+        new_k = np.maximum(k + dk, 1e-5)
+        net.set_K(new_k)
 
         # ── Free phase with updated network ───────────────────────────────────
-        state_F = net.solve(self.Q_in)
+        state_F = net.solve_q_p(self.Q_in)
         p_F_new = state_F['pressures']
         new_loss = self.loss(state_F['flows'][self.target_idx])
 
@@ -136,7 +146,7 @@ class ContrastiveOptimizer:
         log_every : print and record history every N steps
         """
         # Initial free phase
-        state_F = self.net.solve(self.Q_in)
+        state_F = self.net.solve_q_p(self.Q_in)
         p_F     = state_F['pressures']
         current_loss = self.loss(state_F['flows'][self.target_idx])
 
