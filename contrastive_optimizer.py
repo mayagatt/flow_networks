@@ -94,29 +94,20 @@ class ContrastiveOptimizer:
 
     # ── Single step ───────────────────────────────────────────────────────────
 
-    def step(self, p_F: np.ndarray,q_F: np.ndarray , current_loss: float):
+    def step(self, p_F: np.ndarray,q_F: np.ndarray, loss: float) -> tuple:
         """Run one free→clamp→update→rebuild cycle. Returns updated p_F, loss."""
         net = self.net
 
-        # ── Clamped phase: nudge Q_in to push more flow through target edge ──
-        state_F = net.solve_q_p(self.Q_in)
-        p_F     = state_F['pressures']
-        q_F     = state_F['flows']
-
-        # distance of the current flow from the desired flow of the target edge
-        loss   = (q_F[self.target_idx] - self.desired_flow_target)**2 
-
-        # add flow to the target edge to the source/sink vector, according to the loss
+        # The contrastive learning way: add target edge flow to the source/sink vector, according to the loss
         Qin_C   = self.Q_in + self.eps * loss * net.B[:, self.target_idx]
 
         # resolve the state of the network in its clamped state
         state_C = net.solve_q_p(Qin_C)
-        p_C     = state_C['pressures']
 
         # ── Conductance update ────────────────────────────────────────────────
         # compute dk for each edge based on the difference between the free and clamped phases
         if self.update_func == 'PD':
-            dk = self._conductance_update_PD(p_F, p_C)
+            dk = self._conductance_update_PD(p_F=p_F, p_C=state_C['pressures'])
         elif self.update_func == 'SR':
             dk = self._conductance_update_SR(q_F=q_F, q_C=state_C['flows'])
         else:
@@ -127,12 +118,12 @@ class ContrastiveOptimizer:
         new_k = np.maximum(k + dk, 1e-5)
         net.set_K(new_k)
 
-        # ── Free phase with updated network ───────────────────────────────────
-        state_F = net.solve_q_p(self.Q_in)
-        p_F_new = state_F['pressures']
-        new_loss = self.loss(state_F['flows'][self.target_idx])
+        # ── Recompute free phase with updated network ───────────────────────────────────
+        state_F_new = net.solve_q_p(self.Q_in)
+        q_F_new = state_F_new['flows']
+        loss_new = self.loss(q_F_new[self.target_idx])
 
-        return p_F_new, new_loss, state_F
+        return state_F_new, loss_new
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -148,11 +139,12 @@ class ContrastiveOptimizer:
         # Initial free phase
         state_F = self.net.solve_q_p(self.Q_in)
         p_F     = state_F['pressures']
-        current_loss = self.loss(state_F['flows'][self.target_idx])
+        q_F     = state_F['flows']
+        loss    = self.loss(q_F[self.target_idx])
 
         print(f"Initial flow on {self.target_edge}: "
-              f"{state_F['flows'][self.target_idx]:.4f}  |  "
-              f"target: {self.target_flow}  |  loss: {current_loss:.6f}")
+              f"{q_F[self.target_idx]:.4f}  |  "
+              f"target: {self.target_flow}  |  loss: {loss:.6f}")
 
         # Save initial state for before/after plots
         self._state_init = state_F
@@ -160,27 +152,27 @@ class ContrastiveOptimizer:
 
         print("\n=== Optimization start ===")
         for ii in range(1, max_iter + 1):
-            p_F, current_loss, state_F = self.step(p_F, state_F['flows'], current_loss)
-            self.losses.append(current_loss)
+            state_F, loss = self.step(p_F, q_F, loss)
+            self.losses.append(loss)
 
             if ii % log_every == 0:
                 flow = state_F['flows'][self.target_idx]
-                print(f"Iter {ii:>7}  |  flow: {flow:.5f}  |  loss: {current_loss:.6f}")
+                print(f"Iter {ii:>7}  |  flow: {flow:.5f}  |  loss: {loss:.6f}")
                 self.history.append({
                     'step':         ii,
-                    'loss':         current_loss,
+                    'loss':         loss,
                     'flow_target':  flow,
                     'conductances': np.diag(self.net.K).copy(),
                     'flows':        state_F['flows'].copy(),
                     'pressures':    state_F['pressures'].copy(),
                 })
 
-            if current_loss < self.loss_tol:
-                print(f"\n✓ Converged at iteration {ii}  |  loss: {current_loss:.2e}")
+            if loss < self.loss_tol:
+                print(f"\n✓ Converged at iteration {ii}  |  loss: {loss:.2e}")
                 break
         else:
             print(f"\n✗ Did not converge in {max_iter} iterations  |  "
-                  f"final loss: {current_loss:.6f}")
+                  f"final loss: {loss:.6f}")
 
         # Always record final state
         self._state_final = state_F
