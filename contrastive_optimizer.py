@@ -24,7 +24,7 @@ class ContrastiveOptimizer:
     target_flow  : float       — desired flow on that edge
     update_func  : str         — 'PD' = power dissipation difference, 'SR' = shear rate difference
     learning_rate: float       — step size for conductance updates
-    nudge_strength: float      — scales how strongly Q_in is nudged in clamped phase
+    clamp_strength: float      — scales how strongly Q_in is nudged in clamped phase
     loss_tol     : float       — stop when loss < loss_tol
 
     Example
@@ -35,7 +35,7 @@ class ContrastiveOptimizer:
     ...     target_edge=(1, 2),
     ...     target_flow=0.3,
     ...     learning_rate=0.01,
-    ...     nudge_strength=0.01,
+    ...     clamp_strength=0.01,
     ...     loss_tol=1e-4,
     ... )
     >>> opt.run(max_iter=100_000, log_every=1000)
@@ -44,25 +44,36 @@ class ContrastiveOptimizer:
     """
 
     def __init__(self, network: FlowNetwork, Q_in: np.ndarray,
-                 target_edge: tuple, target_flow: float,
-                 update_func: str,  # 'PD' = power dissipation difference, 'SR' = shear rate difference
+                 target_edge: tuple, desired_flow_target: float,
+                 update_func: str,  # 'PD' = power dissipation difference, 'SR' = shear rate difference, 'SR_global_shear' = global shear rate difference
                  learning_rate: float = 0.01,
-                 nudge_strength: float = 0.01,
+                 clamp_strength: float = 0.01,
                  loss_tol: float = 1e-4):
 
         self.net_init = network                     # original (never mutated)
         self.net = copy.deepcopy(network)           # working copy
         self.Q_in = Q_in.astype(float)
         self.target_edge = target_edge
-        self.desired_flow_target = target_flow
+        self.desired_flow_target = desired_flow_target
         self.lr = learning_rate
-        self.eps = nudge_strength
+        self.eps = clamp_strength
         self.loss_tol = loss_tol
         self.update_func = update_func
 
+        self.tau_0 = self.net_init.get_K()**(1/4) * self.net_init.solve_q_p(self.Q_in)['flows']
+
         self.target_idx = self.net.edge_index(target_edge)
-        self.history = []
-        self.losses = []
+        self.hist_scalars = {
+            'step': [],
+            'loss': [],
+            'flow_target': []
+        }
+        
+        self.hist_arrays = {
+            'conductances': [],
+            'flows':        [],
+            'pressures':    []
+        }
 
     # ── Loss ──────────────────────────────────────────────────────────────────
 
@@ -80,17 +91,23 @@ class ContrastiveOptimizer:
         B = self.net.B
         dp_F = B.T @ p_F
         dp_C = B.T @ p_C
-        return self.lr * (dp_C ** 2 - dp_F ** 2)
+        return self.lr * (dp_F ** 2 - dp_C ** 2)
     
     def _conductance_update_SR(self, q_F: np.ndarray, q_C: np.ndarray) -> np.ndarray:
         """
-        dk_ij = lr * k_ij² * (q_F_ij - q_C_ij)
+        dk_ij = lr * k_ij^(1/4) * (q_F_ij - q_C_ij)
         Increase conductance where free phase has more flow → drives flow
         toward target.
         """
         k = np.diag(self.net.K)
-        dk = k**2 * (q_F - q_C)
+        dk = k**(1/4) * (q_F - q_C)
         return self.lr * dk
+    
+    def _conductance_update_SR_global_shear(self, q_F: np.ndarray, q_C: np.ndarray) -> np.ndarray:
+        k = np.diag(self.net.K)
+        tau = k**(1/4) * q_F
+        tau_0 = self.tau_0
+        return self.lr * (tau - tau_0)
 
     # ── Single step ───────────────────────────────────────────────────────────
 
@@ -110,13 +127,15 @@ class ContrastiveOptimizer:
             dk = self._conductance_update_PD(p_F=p_F, p_C=state_C['pressures'])
         elif self.update_func == 'SR':
             dk = self._conductance_update_SR(q_F=q_F, q_C=state_C['flows'])
+        elif self.update_func == 'SR_global_shear':
+            dk = self._conductance_update_SR_global_shear(q_F=q_F, q_C=state_C['flows'])
         else:
             raise ValueError(f"Invalid update_func: {self.update_func}. Choose 'PD' or 'SR'.")
 
         # apply dk to the edge weights, ensuring they remain positive
         k = net.get_K()
         new_k = np.maximum(k + dk, 1e-5)
-        net.set_K(new_k)
+        net.set_K(new_k)  # might be a bug - not sure if the network is saved
 
         # ── Recompute free phase with updated network ───────────────────────────────────
         state_F_new = net.solve_q_p(self.Q_in)
@@ -136,6 +155,14 @@ class ContrastiveOptimizer:
         max_iter  : maximum number of iterations
         log_every : print and record history every N steps
         """
+        n_log = max_iter // log_every
+        arr = {
+            'conductances': np.empty((n_log, len(self.net.edges))),
+            'flows':        np.empty((n_log, len(self.net.edges))),
+            'pressures':    np.empty((n_log, len(self.net.nodes))),
+        }
+        t = 0
+
         # Initial free phase
         state_F = self.net.solve_q_p(self.Q_in)
         p_F     = state_F['pressures']
@@ -143,36 +170,46 @@ class ContrastiveOptimizer:
         loss    = self.loss(q_F[self.target_idx])
 
         print(f"Initial flow on {self.target_edge}: "
-              f"{q_F[self.target_idx]:.4f}  |  "
-              f"target: {self.target_flow}  |  loss: {loss:.6f}")
+            f"{q_F[self.target_idx]:.4f}  |  "
+            f"target: {self.desired_flow_target}  |  loss: {loss:.6f}")
 
-        # Save initial state for before/after plots
         self._state_init = state_F
         self._K_init     = np.diag(self.net_init.K).copy()
 
         print("\n=== Optimization start ===")
         for ii in range(1, max_iter + 1):
             state_F, loss = self.step(p_F, q_F, loss)
-            self.losses.append(loss)
+            p_F = state_F['pressures']
+            q_F = state_F['flows']
+
 
             if ii % log_every == 0:
                 flow = state_F['flows'][self.target_idx]
                 print(f"Iter {ii:>7}  |  flow: {flow:.5f}  |  loss: {loss:.6f}")
-                self.history.append({
-                    'step':         ii,
-                    'loss':         loss,
-                    'flow_target':  flow,
-                    'conductances': np.diag(self.net.K).copy(),
-                    'flows':        state_F['flows'].copy(),
-                    'pressures':    state_F['pressures'].copy(),
-                })
+
+                self.hist_scalars['step'].append(ii)
+                self.hist_scalars['loss'].append(loss)
+                self.hist_scalars['flow_target'].append(flow)
+
+                arr['conductances'][t] = np.diag(self.net.K)
+                arr['flows'][t]        = state_F['flows']
+                arr['pressures'][t]    = state_F['pressures']
+                t += 1
 
             if loss < self.loss_tol:
                 print(f"\n✓ Converged at iteration {ii}  |  loss: {loss:.2e}")
                 break
         else:
             print(f"\n✗ Did not converge in {max_iter} iterations  |  "
-                  f"final loss: {loss:.6f}")
+                f"final loss: {loss:.6f}")
+
+        # Convert scalars to arrays for plotting
+        self.hist_scalars['step']        = np.array(self.hist_scalars['step'])
+        self.hist_scalars['loss']        = np.array(self.hist_scalars['loss'])
+        self.hist_scalars['flow_target'] = np.array(self.hist_scalars['flow_target'])
+
+        # Trim unused pre-allocated rows (if converged early) and store
+        self.hist_arrays = {k: v[:t] for k, v in arr.items()}
 
         # Always record final state
         self._state_final = state_F
@@ -183,7 +220,7 @@ class ContrastiveOptimizer:
     def plot_loss(self):
         """Plot loss curve over all iterations."""
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(self.losses, color='tomato', lw=1.5)
+        ax.plot(self.hist_scalars['loss'], color='tomato', lw=1.5)
         ax.axhline(self.loss_tol, color='steelblue', ls='--', lw=1,
                    label=f'tolerance = {self.loss_tol}')
         ax.set_yscale('log')
@@ -196,12 +233,12 @@ class ContrastiveOptimizer:
 
     def plot_history_flows(self):
         """Plot flow on each edge over logged history steps."""
-        if not self.history:
+        if not self.hist_scalars['step']:
             print("No history recorded. Run with log_every < max_iter.")
             return
 
-        steps  = [h['step']        for h in self.history]
-        flows  = np.array([h['flows'] for h in self.history])
+        steps  = self.hist_scalars['step']
+        flows  = self.hist_arrays['flows']
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 
@@ -218,7 +255,7 @@ class ContrastiveOptimizer:
         axes[0].set_title('Edge Flows over Training')
         axes[0].legend(fontsize=9)
 
-        losses = [h['loss'] for h in self.history]
+        losses = self.hist_scalars['loss']
         axes[1].plot(steps, losses, color='tomato')
         axes[1].set_yscale('log')
         axes[1].set_xlabel('Iteration')
@@ -232,7 +269,7 @@ class ContrastiveOptimizer:
         """Before/after plots of conductances and flows."""
         self.net.plot_before_after(
             values_before=self._K_init,
-            values_after=self._K_final,
+            values_after=self.hist_arrays['conductances'][-1],
             G_before=self.net_init.G,
             G_after=self.net.G,
             title='Conductances', label='Conductance',
@@ -240,32 +277,36 @@ class ContrastiveOptimizer:
             label_fontsize=label_fontsize)
 
         self.net.plot_before_after(
-            values_before=self._state_init['flows'],
-            values_after=self._state_final['flows'],
+            values_before=self.hist_arrays['flows'][0],
+            values_after=self.hist_arrays['flows'][-1],
             G_before=self.net_init.G,
             G_after=self.net.G,
             title='Edge Flows', label='Flow',
             cmap=plt.cm.managua.reversed(), log_scale=log_scale,
             label_fontsize=label_fontsize)
         
+
+    def plot_history(self, title, label_fontsize=18):
+        """Plot loss, flows, and conductances over logged history steps."""
       # ── Loss + history flows side by side ─────────────────────────────────
-        if not self.history:
-            self.plot_loss()
-            return
+        # if self.hist_scalars['step'].size == 0:
+        #     self.plot_loss()
+        #     return
 
-        steps = [h['step']  for h in self.history]
-        flows = np.array([h['flows'] for h in self.history])
+        steps = self.hist_scalars['step']
+        flows = self.hist_arrays['flows']
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        # set tiel for the whole panel
+        fig.suptitle(title, fontsize=label_fontsize)
 
         # Loss curve
-        axes[0].plot(self.losses, color='tomato', lw=1.5)
+        axes[0].plot(self.hist_scalars['loss'], color='tomato', lw=1.5)
         axes[0].axhline(self.loss_tol, color='steelblue', ls='--', lw=1,
                         label=f'tolerance = {self.loss_tol}')
         axes[0].set_yscale('log')
         axes[0].set_xlabel('Iteration', fontsize=label_fontsize - 4)
         axes[0].set_ylabel('Loss', fontsize=label_fontsize - 4)
-        axes[0].set_title('Loss Curve', fontsize=label_fontsize - 2)
         axes[0].legend(fontsize=label_fontsize - 6)
         axes[0].tick_params(labelsize=label_fontsize - 6)
 
@@ -276,13 +317,26 @@ class ContrastiveOptimizer:
                         lw=2.5 if is_target else 1,
                         ls='-'  if is_target else '--',
                         label=f"({u},{v}){' ← target' if is_target else ''}")
-        axes[1].axhline(self.target_flow, color='red', lw=1.5, ls=':',
-                        label=f"target = {self.target_flow}")
+        axes[1].axhline(self.desired_flow_target, color='red', lw=1.5, ls=':',
+                        label=f"desired flow = {self.desired_flow_target}")
         axes[1].set_xlabel('Iteration', fontsize=label_fontsize - 4)
         axes[1].set_ylabel('Flow', fontsize=label_fontsize - 4)
-        axes[1].set_title('Edge Flows over Training', fontsize=label_fontsize - 2)
         axes[1].legend(fontsize=label_fontsize - 6)
         axes[1].tick_params(labelsize=label_fontsize - 6)
+
+        # plot conductance history
+        conductances = self.hist_arrays['conductances']
+        for i, (u, v) in enumerate(self.net.edges):
+            is_target = (u, v) == self.target_edge
+            axes[2].plot(steps, conductances[:, i], 
+                        lw=1.5 if is_target else 1,
+                        ls='-'  if is_target else '--', 
+                        label=f"({u},{v}) {' ← target' if is_target else ''}")
+
+        axes[2].set_xlabel('Iteration', fontsize=label_fontsize - 4)
+        axes[2].set_ylabel('Conductance', fontsize=label_fontsize - 4)
+        axes[2].legend(fontsize=label_fontsize - 6)
+        axes[2].tick_params(labelsize=label_fontsize - 6)
 
         plt.tight_layout()
         plt.show()
