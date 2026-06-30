@@ -47,6 +47,10 @@ class FlowNetwork:
         self.pos = nx.spring_layout(self.G, seed=42)
         self._build_matrices()
 
+    @property
+    def nodes(self):
+        return list(self.G.nodes)
+    
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _build_matrices(self):
