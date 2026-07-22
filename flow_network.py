@@ -44,7 +44,18 @@ class FlowNetwork:
 
     def __init__(self, W: np.ndarray):
         self.G = nx.from_numpy_array(W)
-        self.pos = nx.spring_layout(self.G, seed=42)
+
+        # build subgraph of only positive-weight edges
+        pos_edges = [(u, v) for u, v, d in self.G.edges(data=True) if d.get('weight', 0) > 0]
+        H = self.G.edge_subgraph(pos_edges)
+
+        is_planar, embedding = nx.check_planarity(H)
+        print(f'Is planar: {is_planar}')
+        
+        if is_planar:
+            self.pos = nx.planar_layout(H)
+        else:    
+            self.pos = nx.spring_layout(self.G, seed=42)
         self._build_matrices()
 
     @property
@@ -175,7 +186,7 @@ class FlowNetwork:
     def plot_conductances(self, log_scale=False):
         K_vec = np.diag(self.K)
         self.plot_edge_property(K_vec, title='Edge Conductances',
-                                label='Conductance', cmap=plt.cm.YlOrRd,
+                                label='Conductance', cmap=plt.cm.berlin,
                                 log_scale=log_scale)
 
     def plot_flows(self, Q_in: np.ndarray, log_scale=False):
